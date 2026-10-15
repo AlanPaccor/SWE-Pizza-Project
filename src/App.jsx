@@ -1,8 +1,11 @@
 // src/App.jsx
 // src/App.jsx
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import { supabase } from './supabaseClient';
 import HomeMenu from './HomeMenu';
 import { SIZES, CRUSTS, SAUCE_LEVELS, VEGGIE_OPTIONS, MEAT_OPTIONS } from './menuData';
+import OrderReceiptModal from './OrderReceiptModal';
+
 
 const DEFAULT_PIZZA = {
   size: SIZES[1], // Medium default
@@ -13,6 +16,21 @@ const DEFAULT_PIZZA = {
 };
 
 export default function App() {
+  // testing the supbase connection on load
+   useEffect(() => {
+    async function testConnection() {
+      const { data, error } = await supabase.from('menu_items').select('*');
+      if (error) {
+        console.error('Supabase connection error:', error.message);
+      } else {
+        console.log('Supabase connected successfully! Menu items:', data);
+      }
+    }
+    testConnection();
+  }, []);
+
+
+
   // Navigation: 'landing' (Home/Menu showcase) vs 'order' (Customizer flow)
   const [currentView, setCurrentView] = useState('landing');
   const [activeStep, setActiveStep] = useState('details'); // 'details' | 'menu'
@@ -27,6 +45,10 @@ export default function App() {
     orderType: 'delivery',
   });
 
+  // Phone number input Validation
+  const [searchPhoneError, setSearchPhoneError] = useState('');
+  const [formPhoneError, setFormPhoneError] = useState('');
+
   // Pizza State
   const [pizzaBuilder, setPizzaBuilder] = useState(DEFAULT_PIZZA);
   const [editingId, setEditingId] = useState(null);
@@ -37,10 +59,223 @@ export default function App() {
   const [cart, setCart] = useState([]);
   const [isCartOpen, setIsCartOpen] = useState(false);
 
+  // Returning Customer & Reorder States
+  const [searchPhone, setSearchPhone] = useState('');
+  const [isSearchingPhone, setIsSearchingPhone] = useState(false);
+  const [pastOrders, setPastOrders] = useState([]);
+  const [isReturningUser, setIsReturningUser] = useState(false);
+  const [lookupMessage, setLookupMessage] = useState(null);
+
+  // Modal & Payment States
+  const [isCheckoutModalOpen, setIsCheckoutModalOpen] = useState(false);
+  const [selectedPaymentMethod, setSelectedPaymentMethod] = useState('credit');
+  const [selectedTipPercent, setSelectedTipPercent] = useState(15);
+  const [customTipAmount, setCustomTipAmount] = useState('');
+
+  
+
+  // Signature States & Refs
+  const [signatureMode, setSignatureMode] = useState('draw'); // 'draw' | 'type'
+  const [typedSignature, setTypedSignature] = useState('');
+  const [signatureAgreed, setSignatureAgreed] = useState(false);
+  const [hasDrawnSignature, setHasDrawnSignature] = useState(false);
+  const canvasRef = useRef(null);
+  const isDrawingRef = useRef(false);
+
+  // Receipt Modal States
+  const [completedOrderReceipt, setCompletedOrderReceipt] = useState(null);
+  const [isReceiptModalOpen, setIsReceiptModalOpen] = useState(false);
+
+ 
   // Input change handler
   const handleCustomerChange = (e) => {
     const { name, value } = e.target;
     setCustomerInfo((prev) => ({ ...prev, [name]: value }));
+  };
+
+  // new customer ID creation
+  const [customerId, setCustomerId] = useState(null);
+
+  // Formats the phone number entered into 555-555-5555 as the user types
+  const formatPhoneNumber = (value) => {
+  if (!value) return '';
+  const digits = value.replace(/\D/g, '').slice(0, 10);
+
+  if (digits.length <= 3) {
+    return digits;
+  }
+  if (digits.length <= 6) {
+    return `${digits.slice(0, 3)}-${digits.slice(3)}`;
+  }
+  return `${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6)}`;
+ 
+  };
+
+  // Takes the dashes out and verifies exactly 10 digits 
+  const isValidTenDigitPhone = (formattedValue) => {
+  const cleanDigits = (formattedValue || '').replace(/\D/g, '');
+  return cleanDigits.length === 10;
+  };
+
+  // Updates Quick Lookup input
+  const handleSearchPhoneChange = (e) => {
+  const formatted = formatPhoneNumber(e.target.value);
+  setSearchPhone(formatted);
+  if (searchPhoneError) setSearchPhoneError('');
+  };
+
+  // Updates customer number form field as they type
+  const handleFormPhoneChange = (e) => {
+  const formatted = formatPhoneNumber(e.target.value);
+  setCustomerInfo((prev) => ({ ...prev, phone: formatted }));
+  if (formPhoneError) setFormPhoneError('');
+  };
+
+  // search for existing customer my phone number
+  const handlePhoneLookup = async (e) => {
+  e.preventDefault();
+  const cleanPhone = (searchPhone || '').replace(/\D/g, '');
+
+  if (cleanPhone.length !== 10) {
+    setSearchPhoneError('Please enter a valid 10-digit phone number.');
+    alert('Please enter a valid phone number (10 digit with no letters).');
+    return;
+  }
+
+  setIsSearchingPhone(true);
+  setLookupMessage(null);
+  setSearchPhoneError('');
+
+  try {
+    
+    const { data: customerData, error: customerError } = await supabase
+      .from('customers')
+      .select('*')
+      .ilike('phone_number', `%${cleanPhone}%`)
+      .limit(1);
+
+    if (customerError) throw customerError;
+
+    if (customerData && customerData.length > 0) {
+      const foundCustomer = customerData[0];
+      setCustomerId(foundCustomer.id);
+      setIsReturningUser(true);
+      setSearchPhoneError('');
+
+      // Pre-fill form fields
+      setCustomerInfo((prev) => ({
+        ...prev,
+        name: `${foundCustomer.first_name || ''} ${foundCustomer.last_name || ''}`.trim(),
+        phone: formatPhoneNumber(foundCustomer.phone_number || ''),
+        streetAddress: foundCustomer.address || '',
+        subdivision: foundCustomer.subdivision || '',
+        nearestIntersection: foundCustomer.major_intersection || '',
+      }));
+
+      // Fetch customer's past orders with joined order_items
+      const { data: ordersData, error: ordersError } = await supabase
+        .from('orders')
+        .select('*, order_items(*)')
+        .eq('customer_id', foundCustomer.id)
+        .order('created_at', { ascending: false });
+
+      if (!ordersError && ordersData) {
+        setPastOrders(ordersData);
+      }
+
+      setLookupMessage({
+        type: 'success',
+        text: `Welcome back, ${foundCustomer.first_name || 'friend'}! We loaded your details.`,
+      });
+    } else {
+      setIsReturningUser(false);
+      setPastOrders([]);
+      setSearchPhoneError('No account found with this phone number.');
+      // pop-up for testing if the database was working correctly 
+      // alert('Phone number not found. Pleaase enter a valid registered phone number or fill in your details below as a new customer.')
+      setLookupMessage({
+        type: 'info',
+        text: 'No prior profile found with that number. Please fill out your details below to get started!',
+      });
+    }
+  } catch (err) {
+    console.error('Phone lookup error:', err.message || err);
+    setLookupMessage({
+      type: 'error',
+      text: 'Unable to check records. Please fill in your details below.',
+    });
+  } finally {
+    setIsSearchingPhone(false);
+  }
+};
+
+// Quick re-order. Add entire past pizza directly into active cart
+const handleReorderPizza = (item) => {
+  // Map database item back to front-end cart
+  const reorderedPizza = {
+    id: Date.now(),
+    size: { label: item.size },
+    crust: { label: item.crust },
+    sauce: { label: item.sauce },
+    selectedVeggies: (item.toppings || []).map((name) => ({ name })),
+    selectedMeats: [],
+    price: parseFloat(item.price).toFixed(2),
+  };
+  setCart((prev) => [...prev, reorderedPizza]);
+  setIsCartOpen(true);
+};
+
+
+  // sending customer record to Supabase on submission of form
+  // ***** EDIT THIS ONE NEXT 
+  const handleCustomerSubmit = async (e) => {
+    e.preventDefault();
+    const rawDigitsOnly = (customerInfo.phone || '').replace(/\D/g, '');
+
+    if (rawDigitsOnly.length !== 10) {
+      setFormPhoneError('Please enter a valid 10-digit phone number.');
+      alert('Please enter a valid phone number.');
+      return;
+    }
+
+    setFormPhoneError('');
+
+    try {
+          const nameParts = customerInfo.name.trim().split(' ');
+          const firstName = nameParts[0] || '';
+          const lastName = nameParts.slice(1).join(' ') || '';
+
+
+
+
+    
+   
+    if (!customerId) {
+      const { data, error } = await supabase
+        .from('customers')
+        .insert([
+          {
+            first_name: firstName,
+            last_name: lastName,
+            phone_number: rawDigitsOnly,
+            address: customerInfo.streetAddress,
+            subdivision: customerInfo.subdivision,
+            major_intersection: customerInfo.nearestIntersection,
+          },
+        ])
+        .select();
+
+        if (error) throw error;
+        if (data && data.length > 0) {
+          setCustomerId(data[0].id);
+        }
+      }
+
+      setActiveStep('builder');
+    } catch (err) {
+      console.error('Error saving customer:', err.message || err);
+      alert('Failed to save customer details.');
+    }
   };
 
   // Toggle Veggie selection
@@ -109,6 +344,233 @@ export default function App() {
 
   const grandTotal = cart.reduce((sum, item) => sum + parseFloat(item.price), 0).toFixed(2);
 
+   // Financial Calculations
+  const subtotalNumber = parseFloat(grandTotal) || 0;
+  const deliveryFee = customerInfo.orderType === 'delivery' ? 3.99 : 0.0;
+  const tax = parseFloat((subtotalNumber * 0.08).toFixed(2));
+  const tipAmount =
+    selectedTipPercent === 'custom'
+      ? parseFloat(customTipAmount) || 0
+      : parseFloat(((subtotalNumber * selectedTipPercent) / 100).toFixed(2));
+  const finalGrandTotal = parseFloat((subtotalNumber + deliveryFee + tax + tipAmount).toFixed(2));
+
+  // Signature Drawing 
+  const startDrawing = (e) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const rect = canvas.getBoundingClientRect();
+    const clientX = e.clientX || (e.touches && e.touches[0].clientX);
+    const clientY = e.clientY || (e.touches && e.touches[0].clientY);
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
+
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    isDrawingRef.current = true;
+    setHasDrawnSignature(true);
+  };
+
+  const draw = (e) => {
+    if (!isDrawingRef.current) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const rect = canvas.getBoundingClientRect();
+    const clientX = e.clientX || (e.touches && e.touches[0].clientX);
+    const clientY = e.clientY || (e.touches && e.touches[0].clientY);
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
+
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#fef3c7'; // amber/cream color
+    ctx.lineTo(x, y);
+    ctx.stroke();
+  };
+
+  const stopDrawing = () => {
+    isDrawingRef.current = false;
+  };
+
+  const clearCanvasSignature = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    setHasDrawnSignature(false);
+  };
+
+ // Final Payment and Receipt Submission
+  
+
+  // checkout handler
+  const [isSubmittingOrder, setIsSubmittingOrder] = useState(false);
+
+  // Final Payment and Receipt Submission
+  const handleFinalPaymentSubmit = async () => {
+    if (cart.length === 0) return;
+
+    // Validate Signature
+    if (signatureMode === 'draw' && !hasDrawnSignature) {
+      alert('Please draw your signature before placing the order.');
+      return;
+    }
+    if (signatureMode === 'type' && (!typedSignature.trim() || !signatureAgreed)) {
+      alert('Please type your name and check the consent box to sign.');
+      return;
+    }
+
+    setIsSubmittingOrder(true);
+
+    try {
+      // 1. Insert order into Supabase
+      const { data: orderData, error: orderError } = await supabase
+        .from('orders')
+        .insert([
+          {
+            customer_id: customerId,
+            order_type: customerInfo.orderType,
+            payment_method: selectedPaymentMethod,
+            payment_status: selectedPaymentMethod === 'cash' ? 'cash_on_delivery' : 'paid',
+            subtotal: subtotalNumber,
+            delivery_fee: deliveryFee,
+            tax: tax,
+            tip: tipAmount,
+            total_price: finalGrandTotal,
+            status: 'received',
+          },
+        ])
+        .select();
+
+      if (orderError) throw orderError;
+      const newOrderId = orderData[0].id;
+
+      // 2. Format order items
+      const orderItemsToInsert = cart.map((pizza) => ({
+        order_id: newOrderId,
+        size: pizza.size.label,
+        crust: pizza.crust.label,
+        sauce: pizza.sauce.label,
+        toppings: [...(pizza.selectedMeats || []), ...(pizza.selectedVeggies || [])].map((t) => t.name),
+        price: parseFloat(pizza.price),
+      }));
+
+      // 3. Insert items into 'order_items'
+      const { error: itemsError } = await supabase
+        .from('order_items')
+        .insert(orderItemsToInsert);
+
+      if (itemsError) throw itemsError;
+
+      // 4. Capture Signature Data URL if drawn
+      let signatureDataUrl = null;
+      if (signatureMode === 'draw' && canvasRef.current) {
+        signatureDataUrl = canvasRef.current.toDataURL('image/png');
+      }
+
+      // 5. Store completed receipt data
+      setCompletedOrderReceipt({
+        orderId: newOrderId,
+        timestamp: new Date().toLocaleString('en-US', {
+          dateStyle: 'medium',
+          timeStyle: 'short',
+        }),
+        customer: { ...customerInfo },
+        items: [...cart],
+        paymentMethod: selectedPaymentMethod,
+        subtotal: subtotalNumber,
+        deliveryFee,
+        tax,
+        tip: tipAmount,
+        grandTotal: finalGrandTotal,
+        signatureMode,
+        signatureDataUrl,
+        typedSignature,
+      });
+
+      // 6. Transition UI
+      setCart([]);
+      setIsCheckoutModalOpen(false);
+      setIsReceiptModalOpen(true);
+    } catch (err) {
+      console.error('Error placing order:', err.message || err);
+      alert('There was an issue saving your order. Check console.');
+    } finally {
+      setIsSubmittingOrder(false);
+    }
+  };
+
+  const handleCheckout = async () => {
+    if (cart.length === 0) return;
+    setIsSubmittingOrder(true);
+
+    // breaking down the total
+    const subtotalNumber = parseFloat(grandTotal);
+    const deliveryFee = customerInfo.orderType === 'delivery' ? 3.99 : 0.0;
+    const tax = parseFloat((subtotalNumber * 0.08).toFixed(2));
+    const tip = 0.0; // ** bind to tip buttons later
+    const finalTotal = parseFloat((subtotalNumber + deliveryFee + tax + tip).toFixed(2));
+
+    try {
+      // putting into 'orders' table
+      const { data: orderData, error: orderError } = await supabase
+        .from('orders')
+        .insert([
+          {
+            customer_id: customerId,
+            order_type: customerInfo.orderType,
+            payment_method: 'credit', // default
+            payment_status: 'paid',
+            subtotal: subtotalNumber,
+            delivery_fee: deliveryFee,
+            tax: tax,
+            tip: tip,
+            total_price: finalTotal,
+            status: 'received',
+          },
+        ])
+        .select();
+
+        if (orderError) throw orderError;
+
+        const newOrderId = orderData[0].id;
+        console.log('Order created with ID:', newOrderId);
+
+        // formatting pizzas in the cart for 'order_items" table
+        const orderItemsToInsert = cart.map((pizza) => ({
+          order_id: newOrderId,
+          size: pizza.size.label,
+          crust: pizza.crust.label,
+          sauce: pizza.sauce.label,
+          // store topping names into the JSNOV column
+          toppings: [...pizza.selectedMeats, ...pizza.selectedVeggies].map((t) => t.name),
+          price: parseFloat(pizza.price),
+        }));
+
+       const { data: orderItemsData, error: orderItemsError } = await supabase
+         .from('order_items')
+         .insert(orderItemsToInsert)
+         .select();
+
+         if (orderItemsError) throw orderItemsError;
+         console.log('Order items successfully inserted:', orderItemsData);
+
+         // success UI state updates
+         alert(`Order #${newOrderId} successfully placed! Total: $${finalTotal.toFixed(2)}`);
+         setCart([]);
+         setIsCartOpen(false);
+         setCurrentView('landing');
+
+      } catch (err) {
+        console.error('Error placing order:', err.message || err);
+        alert('There was an issue saving your order. Check console.');
+      } finally {
+        setIsSubmittingOrder(false);
+      }
+      
+  };
+
   // Smooth scroll helper for menu/about anchors
   const navigateToSection = (sectionId) => {
     if (currentView !== 'landing') {
@@ -122,10 +584,10 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-stone-950 text-stone-200 font-sans antialiased selection:bg-amber-200 selection:text-stone-950 pb-16">
+    <div className="min-h-screen bg-[#1c1917] text-stone-200 font-sans antialiased selection:bg-amber-200 selection:text-stone-950 pb-16">
       
       {/* ================= FLOATING MODERN NAVBAR ================= */}
-      <nav className="sticky top-0 z-40 backdrop-blur-md bg-stone-950/80 border-b border-stone-800/80 transition-all">
+      <nav className="sticky top-0 z-40 backdrop-blur-md bg-[#1c1917]/90 border-b border-stone-800/80 transition-all">
         <div className="max-w-6xl mx-auto px-4 sm:px-8 h-20 flex items-center justify-between">
           
           {/* Left: Social Media Icons (Blended floating icons) */}
@@ -244,152 +706,234 @@ export default function App() {
             <div className="relative overflow-hidden w-full min-h-[640px]">
               <div
                 className={`flex w-[200%] transition-transform duration-700 ease-[cubic-bezier(0.25,1,0.5,1)] ${
-                  activeStep === 'details' ? 'translate-x-0' : '-translate-x-1/2'
+                  activeStep === 'details' || activeStep === 'customer' 
+                  ? 'translate-x-0'
+                   : '-translate-x-1/2'
                 }`}
               >
-                {/* SECTION 1: CUSTOMER DETAILS */}
-                <div className="w-1/2 pr-4">
-                  <div className="bg-stone-900/80 border border-stone-800 rounded-3xl p-6 sm:p-10 shadow-2xl backdrop-blur-md">
-                    <div className="border-b border-stone-800 pb-5 mb-6 flex justify-between items-center">
-                      <div>
-                        <h2 className="text-2xl font-serif uppercase tracking-wider text-stone-100 flex items-center gap-3">
-                          <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-amber-200 text-stone-950 text-xs font-bold font-mono">
-                            1
-                          </span>
-                          Delivery & Contact
-                        </h2>
-                        <p className="text-stone-400 text-xs mt-1">Please confirm where we are delivering.</p>
+                {/* ================= SECTION 1: CUSTOMER DETAILS & LOOKUP ================= */}
+            <div className="w-1/2 pr-4">
+              <div className="bg-stone-900/90 border border-stone-800 rounded-3xl p-6 sm:p-10 shadow-2xl backdrop-blur-md space-y-8">
+    
+                {/* Header */}
+                <div className="border-b border-stone-800 pb-4">
+                  <span className="text-[11px] font-mono tracking-widest uppercase text-amber-200/80">Step 01</span>
+                  <h3 className="text-2xl font-serif uppercase tracking-wider text-stone-100">Delivery & Customer Info</h3>
+                  <p className="text-xs text-stone-400 mt-1">Returning customer? Enter your phone number below to retrieve your information and past orders.</p>
+               </div>
+
+               {/* Returning Customer Phone Lookup Bar */}
+               <form onSubmit={handlePhoneLookup} className="p-4 rounded-2xl bg-stone-950/80 border border-stone-800/90 space-y-3">
+                 <label className="block text-[11px] font-bold uppercase tracking-wider text-amber-200/90">
+                   ⚡ Quick Lookup (Returning Customers)
+                 </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    autoComplete="tel"
+                    placeholder="Enter phone number (e.g. 5551234567)"
+                    maxLength={12}
+                    value={searchPhone}
+                    onChange={handleSearchPhoneChange}
+                    style={
+                      searchPhoneError
+                        ? { boxShadow: '0 0 18px rgba(239, 68, 68, 0.45)' }
+                        : undefined
+                    }
+                    className={`flex-1 rounded-xl px-4 py-2.5 text-xs text-stone-100 placeholder-stone-500 transition-all duration-300 outline-none ${
+                      searchPhoneError
+                        ? 'bg-rose-950/30 border-2 border-rose-500 ring-2 ring-rose-500/40 shadow-[0_0_15px_rgba(244,63,94,0.3)]'                    
+                        : 'bg-stone-900 border border-stone-700/80 focus:border-amber-300 focus:ring-2 focus:ring-amber-400/40 focus:shadow-[0_0_15px_rgba(251,191,36,0.2)]'                    }`}
+                  />
+                 <button
+                    type="submit"
+                    disabled={isSearchingPhone}
+                    className="px-5 py-2.5 bg-stone-800 hover:bg-stone-700 text-amber-200 text-xs font-semibold rounded-xl border border-stone-700 hover:border-amber-200/40 transition-all cursor-pointer whitespace-nowrap disabled:opacity-50"
+                 >
+                   {isSearchingPhone ? 'Searching...' : 'Find My Info'}
+                 </button>
+              </div>
+
+              {/* Status Message Badge */}
+              {lookupMessage && (
+              <div
+                className={`text-xs px-3.5 py-2 rounded-xl border ${
+                lookupMessage.type === 'success'
+                  ? 'bg-emerald-950/40 border-emerald-800/60 text-emerald-300'
+                  : lookupMessage.type === 'error'
+                  ? 'bg-rose-950/40 border-rose-800/60 text-rose-300'
+                  : 'bg-stone-900 border-stone-700 text-stone-300'
+                }`}
+             >
+               {lookupMessage.text}
+             </div>
+             )}
+            </form>
+
+            {/* Past Order History Section (Only displays if returning user has past orders) */}
+            {isReturningUser && pastOrders.length > 0 && (
+             <div className="p-5 rounded-2xl bg-amber-950/15 border border-amber-900/40 space-y-4">
+               <div className="flex justify-between items-center">
+                 <h4 className="font-serif uppercase tracking-wider text-amber-100 text-sm">
+                    📜 Past Favorites ({pastOrders.length} previous {pastOrders.length === 1 ? 'order' : 'orders'})
+                 </h4>
+                <span className="text-[10px] font-mono uppercase tracking-widest text-amber-300/80">Reorder with 1-click</span>
+               </div>
+
+               <div className="space-y-3 max-h-60 overflow-y-auto pr-1">
+                 {pastOrders.map((order) => (
+                  <div key={order.id} className="p-3.5 rounded-xl bg-stone-900/90 border border-stone-800/80 space-y-2 text-xs">
+                    <div className="flex justify-between items-center text-stone-400 font-mono text-[11px] border-b border-stone-800/60 pb-1.5">
+                      <span>Order #{order.id} • {new Date(order.created_at).toLocaleDateString()}</span>
+                      <span className="text-amber-200 font-bold">${parseFloat(order.total_price).toFixed(2)}</span>
+                   </div>
+
+                   {/* List of pizzas inside this past order */}
+                   <div className="space-y-2">
+                     {order.order_items?.map((item) => (
+                      <div key={item.id} className="flex justify-between items-center gap-3">
+                        <div>
+                          <span className="font-semibold text-stone-200">{item.size} • {item.crust}</span>
+                          <span className="block text-[11px] text-stone-400">
+                            Sauce: {item.sauce} {item.toppings?.length > 0 ? `| Toppings: ${item.toppings.join(', ')}` : ''}
+                         </span>
                       </div>
-                    </div>
-
-                    <form
-                      onSubmit={(e) => {
-                        e.preventDefault();
-                        setActiveStep('menu');
-                      }}
-                      className="space-y-5"
-                    >
-                      {/* Delivery vs Carryout Toggle */}
-                      <div className="grid grid-cols-2 gap-2 p-1 bg-stone-950 border border-stone-800 rounded-2xl">
-                        <button
-                          type="button"
-                          onClick={() => setCustomerInfo((prev) => ({ ...prev, orderType: 'delivery' }))}
-                          className={`py-2.5 px-4 rounded-xl text-xs uppercase font-bold tracking-wider transition-all duration-200 cursor-pointer ${
-                            customerInfo.orderType === 'delivery'
-                              ? 'bg-amber-200 text-stone-950 shadow-md scale-[1.01]'
-                              : 'text-stone-400 hover:text-stone-200'
-                          }`}
-                        >
-                          Delivery
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setCustomerInfo((prev) => ({ ...prev, orderType: 'pickup' }))}
-                          className={`py-2.5 px-4 rounded-xl text-xs uppercase font-bold tracking-wider transition-all duration-200 cursor-pointer ${
-                            customerInfo.orderType === 'pickup'
-                              ? 'bg-amber-200 text-stone-950 shadow-md scale-[1.01]'
-                              : 'text-stone-400 hover:text-stone-200'
-                          }`}
-                        >
-                          Carryout
-                        </button>
-                      </div>
-
-                      {/* Name & Phone */}
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                        <div className="space-y-1">
-                          <div className="flex justify-between items-center text-xs uppercase tracking-wider text-stone-300">
-                            <span>Full Name *</span>
-                            {customerInfo.name.trim().length > 1 && (
-                              <span className="text-emerald-400 text-[11px] font-bold">✓ Done</span>
-                            )}
-                          </div>
-                          <input
-                            type="text"
-                            name="name"
-                            required
-                            placeholder="Alex Morgan"
-                            value={customerInfo.name}
-                            onChange={handleCustomerChange}
-                            className="w-full bg-stone-950/70 border border-stone-800 rounded-xl px-4 py-3 text-stone-100 placeholder-stone-600 outline-none focus:border-amber-200/80 transition-all text-sm"
-                          />
-                        </div>
-
-                        <div className="space-y-1">
-                          <div className="flex justify-between items-center text-xs uppercase tracking-wider text-stone-300">
-                            <span>Phone Number *</span>
-                            {customerInfo.phone.trim().length >= 7 && (
-                              <span className="text-emerald-400 text-[11px] font-bold">✓ Done</span>
-                            )}
-                          </div>
-                          <input
-                            type="tel"
-                            name="phone"
-                            required
-                            placeholder="(555) 000-0000"
-                            value={customerInfo.phone}
-                            onChange={handleCustomerChange}
-                            className="w-full bg-stone-950/70 border border-stone-800 rounded-xl px-4 py-3 text-stone-100 placeholder-stone-600 outline-none focus:border-amber-200/80 transition-all text-sm"
-                          />
-                        </div>
-                      </div>
-
-                      {/* Street Address */}
-                      <div className="space-y-1">
-                        <div className="flex justify-between items-center text-xs uppercase tracking-wider text-stone-300">
-                          <span>Street Address {customerInfo.orderType === 'delivery' && '*'}</span>
-                          {customerInfo.streetAddress.trim().length > 3 && (
-                            <span className="text-emerald-400 text-[11px] font-bold">✓ Done</span>
-                          )}
-                        </div>
-                        <input
-                          type="text"
-                          name="streetAddress"
-                          required={customerInfo.orderType === 'delivery'}
-                          placeholder="123 Oak Hill Road"
-                          value={customerInfo.streetAddress}
-                          onChange={handleCustomerChange}
-                          className="w-full bg-stone-950/70 border border-stone-800 rounded-xl px-4 py-3 text-stone-100 placeholder-stone-600 outline-none focus:border-amber-200/80 transition-all text-sm"
-                        />
-                      </div>
-
-                      {/* Sub-areas */}
-                      <div className="p-4 rounded-2xl bg-stone-950/60 border border-stone-800/80 space-y-3">
-                        <div className="text-[11px] font-bold text-stone-400 uppercase tracking-widest">
-                          Neighborhood & Landmarks
-                        </div>
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                          <input
-                            type="text"
-                            name="subdivision"
-                            placeholder="Subdivision / Community"
-                            value={customerInfo.subdivision}
-                            onChange={handleCustomerChange}
-                            className="w-full bg-stone-900 border border-stone-800 rounded-xl px-3 py-2 text-xs text-stone-200 outline-none focus:border-amber-200 transition-all"
-                          />
-                          <input
-                            type="text"
-                            name="nearestIntersection"
-                            placeholder="Nearest Intersection"
-                            value={customerInfo.nearestIntersection}
-                            onChange={handleCustomerChange}
-                            className="w-full bg-stone-900 border border-stone-800 rounded-xl px-3 py-2 text-xs text-stone-200 outline-none focus:border-amber-200 transition-all"
-                          />
-                        </div>
-                      </div>
-
                       <button
-                        type="submit"
-                        className="w-full py-3.5 px-6 rounded-xl font-bold tracking-wider text-xs uppercase text-stone-950 bg-amber-200 hover:bg-amber-100 shadow-lg shadow-amber-200/10 active:scale-95 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                        type="button"
+                        onClick={() => handleReorderPizza(item)}
+                        className="px-3 py-1 rounded-lg bg-amber-200/10 hover:bg-amber-200/20 text-amber-200 border border-amber-200/30 text-[10px] font-bold uppercase tracking-wider hover:scale-105 active:scale-95 transition-all cursor-pointer whitespace-nowrap"
                       >
-                        <span>Confirm & Build Pizza</span>
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
-                        </svg>
-                      </button>
-                    </form>
-                  </div>
-                </div>
+                        + Re-order
+                     </button>
+                   </div>
+                  ))}
+               </div>
+             </div>
+           ))}
+         </div>
+      </div>
+    )}
+
+    {/* Standard Customer Details Form */}
+    <form onSubmit={handleCustomerSubmit} className="space-y-5">
+      
+      {/* Order Type Toggle */}
+      <div>
+        <label className="block text-xs uppercase tracking-wider text-stone-400 font-semibold mb-2">Order Fulfillment</label>
+        <div className="grid grid-cols-2 gap-3">
+          {['delivery', 'pickup'].map((type) => (
+            <button
+              key={type}
+              type="button"
+              onClick={() => setCustomerInfo((prev) => ({ ...prev, orderType: type }))}
+              className={`py-2.5 rounded-xl border text-xs uppercase tracking-wider font-semibold transition-all cursor-pointer ${
+                customerInfo.orderType === type
+                  ? 'bg-amber-200 text-stone-950 border-amber-200 shadow-md'
+                  : 'bg-stone-950 border-stone-800 text-stone-400 hover:border-stone-700'
+              }`}
+            >
+              {type}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Primary Inputs */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          <label className="block text-xs uppercase tracking-wider text-stone-400 font-semibold mb-1">Full Name</label>
+          <input
+            type="text"
+            name="name"
+            required
+            value={customerInfo.name}
+            onChange={handleCustomerChange}
+            placeholder="Jane Doe"
+            className="w-full bg-stone-950 border border-stone-800 rounded-xl px-4 py-2.5 text-xs text-stone-200 placeholder-stone-600 focus:outline-none focus:border-amber-200/60"
+          />
+        </div>
+
+        <div>
+          <label className="block text-xs uppercase tracking-wider text-stone-400 font-semibold mb-1">Phone Number</label>
+          <input
+            type="text"
+            inputMode="numeric"
+            autoComplete="tel"
+            name="phone"
+            required
+            maxLength={12}
+            value={customerInfo.phone}
+            onChange={handleFormPhoneChange}
+            placeholder="(555) 000-0000"
+            className={`w-full rounded-xl px-4 py-2.5 text-xs text-stone-100 placeholder-stone-600 transition-all duration-300 outline-none ${            
+              formPhoneError
+              ? 'bg-rose-950/30 border-2 border-rose-500 ring-2 ring-rose-500/40 shadow-[0_0_15px_rgba(244,63,94,0.3)]'           
+              : 'bg-stone-950 border border-stone-800 focus:border-amber-300 focus:ring-2 focus:ring-amber-400/40 focus:shadow-[0_0_15px_rgba(251,191,36,0.2)]'           }`}
+          />
+          {formPhoneError && (
+            <p className="text-[11px] text-rose-400 font-medium mt-1">{formPhoneError}</p>
+          )}
+        </div>
+      </div>
+
+      {/* Address Inputs (Conditional on Delivery) */}
+      {customerInfo.orderType === 'delivery' && (
+        <div className="space-y-4 pt-2 border-t border-stone-800/60 animate-in fade-in">
+          <div>
+            <label className="block text-xs uppercase tracking-wider text-stone-400 font-semibold mb-1">Street Address</label>
+            <input
+              type="text"
+              name="streetAddress"
+              required
+              value={customerInfo.streetAddress}
+              onChange={handleCustomerChange}
+              placeholder="123 Stone Oven Way"
+              className="w-full bg-stone-950 border border-stone-800 rounded-xl px-4 py-2.5 text-xs text-stone-200 placeholder-stone-600 focus:outline-none focus:border-amber-200/60"
+            />
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs uppercase tracking-wider text-stone-400 font-semibold mb-1">Subdivision / Complex (Opt)</label>
+              <input
+                type="text"
+                name="subdivision"
+                value={customerInfo.subdivision}
+                onChange={handleCustomerChange}
+                placeholder="e.g. Amber Ridge Apt 4B"
+                className="w-full bg-stone-950 border border-stone-800 rounded-xl px-4 py-2.5 text-xs text-stone-200 placeholder-stone-600 focus:outline-none focus:border-amber-200/60"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs uppercase tracking-wider text-stone-400 font-semibold mb-1">Nearest Major Intersection</label>
+              <input
+                type="text"
+                name="nearestIntersection"
+                value={customerInfo.nearestIntersection}
+                onChange={handleCustomerChange}
+                placeholder="e.g. Main St & 4th Ave"
+                className="w-full bg-stone-950 border border-stone-800 rounded-xl px-4 py-2.5 text-xs text-stone-200 placeholder-stone-600 focus:outline-none focus:border-amber-200/60"
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Submit Actions */}
+      <div className="pt-4 flex flex-col sm:flex-row gap-3">
+        <button
+          type="submit"
+          className="flex-1 py-3.5 bg-amber-200 hover:bg-amber-100 text-stone-950 font-bold rounded-xl text-xs uppercase tracking-wider transition-all duration-300 hover:scale-[1.02] active:scale-95 cursor-pointer shadow-lg shadow-amber-200/10"
+        >
+          {isReturningUser ? 'Confirm Details & Build Custom Pizza →' : 'Save Details & Start Custom Pizza →'}
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
 
                 {/* SECTION 2: PIZZA BUILDER */}
                 <div className="w-1/2 pl-4">
@@ -660,16 +1204,251 @@ export default function App() {
                 </div>
                 <button
                   type="button"
-                  onClick={() => alert(`Proceeding to payment for $${grandTotal}`)}
-                  className="w-full py-3 bg-amber-200 hover:bg-amber-100 text-stone-950 font-bold rounded-xl text-xs uppercase tracking-wider transition-all cursor-pointer"
+                  onClick={() => {
+                   setIsCartOpen(false);
+                   setIsCheckoutModalOpen(true);
+                 }}
+                 className="w-full py-3.5 bg-amber-200 hover:bg-amber-100 text-stone-950 font-bold rounded-xl text-xs uppercase tracking-wider transition-all cursor-pointer shadow-lg shadow-amber-200/10"
                 >
-                  Proceed to Payment
+                  Proceed to Payment (${grandTotal}) →
                 </button>
               </div>
             )}
           </div>
         </div>
       )}
+
+      {/* --------- Checkout and Payment Selection Modal ----------- */}
+      {isCheckoutModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md animate-in fade-in duration-200 overflow-y-auto">
+          <div className="bg-stone-900 border border-stone-800 rounded-3xl max-w-lg w-full max-h-[92vh] shadow-2xl flex flex-col overflow-hidden my-auto">
+            
+            {/* Modal Header */}
+            <div className="p-5 border-b border-stone-800 flex justify-between items-center bg-stone-950">
+              <div>
+                <span className="text-[10px] font-mono uppercase tracking-widest text-amber-200/80">Final Step</span>
+                <h3 className="text-base font-serif uppercase tracking-wider text-stone-100">Review & Pay</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsCheckoutModalOpen(false)}
+                className="text-stone-400 hover:text-white transition-colors cursor-pointer text-xs"
+              >
+                ✕ Cancel
+              </button>
+            </div>
+
+            {/* Modal Scrollable Body */}
+            <div className="p-6 overflow-y-auto space-y-6 text-xs text-stone-300">
+              
+              {/* Payment Method Selector */}
+              <div className="space-y-2">
+                <label className="block text-[11px] font-bold uppercase tracking-wider text-amber-200/90">
+                  Select Payment Method
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  {[
+                    { id: 'credit', label: '💳 Credit' },
+                    { id: 'debit', label: '🏧 Debit' },
+                    { id: 'cash', label: '💵 Cash' },
+                  ].map((m) => (
+                    <button
+                      key={m.id}
+                      type="button"
+                      onClick={() => setSelectedPaymentMethod(m.id)}
+                      className={`py-3 px-2 rounded-xl border text-center transition-all font-semibold cursor-pointer ${
+                        selectedPaymentMethod === m.id
+                          ? 'bg-amber-200 text-stone-950 border-amber-200 shadow-md'
+                          : 'bg-stone-950/80 border-stone-800 text-stone-400 hover:border-stone-700'
+                      }`}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Gratuity / Tip Selection */}
+              <div className="space-y-2">
+                <label className="block text-[11px] font-bold uppercase tracking-wider text-amber-200/90">
+                  Add Tip for the Kitchen & Drivers
+                </label>
+                <div className="grid grid-cols-4 gap-2">
+                  {[15, 18, 20].map((pct) => (
+                    <button
+                      key={pct}
+                      type="button"
+                      onClick={() => setSelectedTipPercent(pct)}
+                      className={`py-2 rounded-xl border text-center transition-all cursor-pointer font-mono ${
+                        selectedTipPercent === pct
+                          ? 'bg-amber-200 text-stone-950 border-amber-200 font-bold'
+                          : 'bg-stone-950/80 border-stone-800 text-stone-400 hover:border-stone-700'
+                      }`}
+                    >
+                      {pct}%
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => setSelectedTipPercent('custom')}
+                    className={`py-2 rounded-xl border text-center transition-all cursor-pointer font-mono ${
+                      selectedTipPercent === 'custom'
+                        ? 'bg-amber-200 text-stone-950 border-amber-200 font-bold'
+                        : 'bg-stone-950/80 border-stone-800 text-stone-400 hover:border-stone-700'
+                    }`}
+                  >
+                    Custom
+                  </button>
+                </div>
+
+                {selectedTipPercent === 'custom' && (
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.50"
+                    placeholder="Enter custom tip amount ($)"
+                    value={customTipAmount}
+                    onChange={(e) => setCustomTipAmount(e.target.value)}
+                    className="w-full bg-stone-950 border border-stone-800 rounded-xl px-4 py-2 text-xs text-stone-200 focus:outline-none focus:border-amber-200/60"
+                  />
+                )}
+              </div>
+
+              {/* Financial Summary */}
+              <div className="p-4 rounded-2xl bg-stone-950/80 border border-stone-800/90 space-y-2">
+                <div className="flex justify-between text-stone-400">
+                  <span>Subtotal:</span>
+                  <span className="font-mono text-stone-200">${subtotalNumber.toFixed(2)}</span>
+                </div>
+                {customerInfo.orderType === 'delivery' && (
+                  <div className="flex justify-between text-stone-400">
+                    <span>Delivery Fee:</span>
+                    <span className="font-mono text-stone-200">${deliveryFee.toFixed(2)}</span>
+                  </div>
+                )}
+                <div className="flex justify-between text-stone-400">
+                  <span>Sales Tax (8%):</span>
+                  <span className="font-mono text-stone-200">${tax.toFixed(2)}</span>
+                </div>
+                <div className="flex justify-between text-stone-400">
+                  <span>Tip:</span>
+                  <span className="font-mono text-amber-200">+${tipAmount.toFixed(2)}</span>
+                </div>
+                <div className="border-t border-stone-800 pt-2 flex justify-between font-bold text-stone-100 text-sm">
+                  <span>Total Amount Due:</span>
+                  <span className="font-mono text-amber-200 text-base">${finalGrandTotal.toFixed(2)}</span>
+                </div>
+              </div>
+
+              {/* Digital Signature Pad */}
+              <div className="space-y-3 pt-2 border-t border-stone-800">
+                <div className="flex justify-between items-center">
+                  <label className="block text-[11px] font-bold uppercase tracking-wider text-amber-200/90">
+                    Customer Signature
+                  </label>
+                  <div className="flex gap-2 text-[10px]">
+                    <button
+                      type="button"
+                      onClick={() => setSignatureMode('draw')}
+                      className={`px-2 py-0.5 rounded cursor-pointer ${
+                        signatureMode === 'draw' ? 'bg-amber-200/20 text-amber-200 font-bold' : 'text-stone-500'
+                      }`}
+                    >
+                      Draw
+                    </button>
+                    <span>|</span>
+                    <button
+                      type="button"
+                      onClick={() => setSignatureMode('type')}
+                      className={`px-2 py-0.5 rounded cursor-pointer ${
+                        signatureMode === 'type' ? 'bg-amber-200/20 text-amber-200 font-bold' : 'text-stone-500'
+                      }`}
+                    >
+                      Type Name
+                    </button>
+                  </div>
+                </div>
+
+                {signatureMode === 'draw' ? (
+                  <div className="space-y-1.5">
+                    <div className="relative border border-stone-700/80 rounded-2xl bg-stone-950 overflow-hidden touch-none">
+                      <canvas
+                        ref={canvasRef}
+                        width={400}
+                        height={120}
+                        onMouseDown={startDrawing}
+                        onMouseMove={draw}
+                        onMouseUp={stopDrawing}
+                        onMouseLeave={stopDrawing}
+                        onTouchStart={startDrawing}
+                        onTouchMove={draw}
+                        onTouchEnd={stopDrawing}
+                        className="w-full h-[120px] cursor-crosshair"
+                      />
+                      <div className="absolute bottom-2 left-4 text-[10px] text-stone-600 font-mono pointer-events-none select-none">
+                        Sign along the line ✍️
+                      </div>
+                    </div>
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        onClick={clearCanvasSignature}
+                        className="text-[10px] text-stone-500 hover:text-stone-300 cursor-pointer"
+                      >
+                        Clear Signature
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <input
+                      type="text"
+                      placeholder="Type your full legal name"
+                      value={typedSignature}
+                      onChange={(e) => setTypedSignature(e.target.value)}
+                      className="w-full bg-stone-950 border border-stone-800 rounded-xl px-4 py-2 text-xs text-stone-200 font-serif italic text-base focus:outline-none focus:border-amber-200/60"
+                    />
+                    <label className="flex items-center gap-2 text-[11px] text-stone-400 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={signatureAgreed}
+                        onChange={(e) => setSignatureAgreed(e.target.checked)}
+                        className="rounded border-stone-700 accent-amber-200 cursor-pointer"
+                      />
+                      <span>I authorize this transaction and accept this as my signature</span>
+                    </label>
+                  </div>
+                )}
+              </div>
+
+            </div>
+
+            {/* Modal Footer Pay Button */}
+            <div className="p-5 border-t border-stone-800 bg-stone-950">
+              <button
+                type="button"
+                onClick={handleFinalPaymentSubmit}
+                disabled={isSubmittingOrder}
+                className="w-full py-3.5 bg-amber-200 hover:bg-amber-100 disabled:opacity-50 text-stone-950 font-bold rounded-xl text-xs uppercase tracking-wider transition-all cursor-pointer shadow-lg shadow-amber-200/10"
+              >
+                {isSubmittingOrder
+                  ? 'Authorizing Transaction...'
+                  : `Authorize & Pay $${finalGrandTotal.toFixed(2)}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ================= PRINTABLE ORDER RECEIPT MODAL ================= */}
+     <OrderReceiptModal
+       isOpen={isReceiptModalOpen}
+       receipt={completedOrderReceipt}
+       onClose={() => {
+         setIsReceiptModalOpen(false);
+         setCurrentView('landing');
+       }}
+     />
 
     </div>
   );
