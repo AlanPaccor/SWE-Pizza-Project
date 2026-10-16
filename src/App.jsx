@@ -72,13 +72,25 @@ export default function App() {
   const [selectedTipPercent, setSelectedTipPercent] = useState(15);
   const [customTipAmount, setCustomTipAmount] = useState('');
 
-  
+  // Card Details & Saved Payments States
+  const [cardForm, setCardForm] = useState({
+    nickname: '',
+    cardNumber: '',
+    cardholderName: '',
+    expiry: '',
+    cvv: '',
+  });
+  const [cardFormErrors, setCardFormErrors] = useState({});
+  const [savedCards, setSavedCards] = useState([]);
+  const [selectedSavedCardId, setSelectedSavedCardId] = useState(null);
+  const [isAddingNewCard, setIsAddingNewCard] = useState(false);
 
   // Signature States & Refs
   const [signatureMode, setSignatureMode] = useState('draw'); // 'draw' | 'type'
   const [typedSignature, setTypedSignature] = useState('');
   const [signatureAgreed, setSignatureAgreed] = useState(false);
   const [hasDrawnSignature, setHasDrawnSignature] = useState(false);
+  const [signatureError, setSignatureError] = useState('');
   const canvasRef = useRef(null);
   const isDrawingRef = useRef(false);
 
@@ -183,6 +195,30 @@ export default function App() {
         setPastOrders(ordersData);
       }
 
+      // fetch customer's saved card
+      const { data: cardsData, error: cardsError } = await supabase
+        .from('customer_payment_methods')
+        .select('*')
+        .eq('customer_id', foundCustomer.id)
+        .order('created_at', { ascending: false });
+
+      if(!cardsError && cardsData && cardsData.length > 0) {
+        const formattedCards = cardsData.map((c) => ({
+          id: c.id.toString(),
+          nickname: c.nickname,
+          brand: c.brand,
+          last4: c.last_four,
+          cardholderName: c.cardholder_name,
+          expiry: c.expiry,
+        }));
+        setSavedCards(formattedCards);
+        setSelectedSavedCardId(formattedCards[0].id); // Defaults selection to latest card
+      } else {
+        setSavedCards([]);
+        setSelectedSavedCardId(null);
+      }
+
+
       setLookupMessage({
         type: 'success',
         text: `Welcome back, ${foundCustomer.first_name || 'friend'}! We loaded your details.`,
@@ -190,6 +226,8 @@ export default function App() {
     } else {
       setIsReturningUser(false);
       setPastOrders([]);
+      setSavedCards([]);
+      setSelectedSavedCardId(null);
       setSearchPhoneError('No account found with this phone number.');
       // pop-up for testing if the database was working correctly 
       // alert('Phone number not found. Pleaase enter a valid registered phone number or fill in your details below as a new customer.')
@@ -227,7 +265,6 @@ const handleReorderPizza = (item) => {
 
 
   // sending customer record to Supabase on submission of form
-  // ***** EDIT THIS ONE NEXT 
   const handleCustomerSubmit = async (e) => {
     e.preventDefault();
     const rawDigitsOnly = (customerInfo.phone || '').replace(/\D/g, '');
@@ -369,6 +406,7 @@ const handleReorderPizza = (item) => {
     ctx.moveTo(x, y);
     isDrawingRef.current = true;
     setHasDrawnSignature(true);
+    if (signatureError) setSignatureError('');
   };
 
   const draw = (e) => {
@@ -399,6 +437,7 @@ const handleReorderPizza = (item) => {
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     setHasDrawnSignature(false);
+    setSignatureError('');
   };
 
  // Final Payment and Receipt Submission
@@ -407,20 +446,163 @@ const handleReorderPizza = (item) => {
   // checkout handler
   const [isSubmittingOrder, setIsSubmittingOrder] = useState(false);
 
+  // -------- Card Formatters and Validation --------
+  const formatCardNumber = (value) => {
+    const raw = value.replace(/\D/g, '').slice(0,16);
+    return raw.replace(/(\d{4})(?=\d)/g, '$1 ');
+  };
+
+    // Format the Expiriation Date of the Debit/Credit card (MM/YY)
+  const formatExpiry = (value) => {
+    const raw = value.replace(/\D/g, '').slice(0, 4);
+    if (raw.length <= 2) return raw;
+    return `${raw.slice(0, 2)}/${raw.slice(2)}`;
+  };
+
+    // Check if card information is valid for checkout
+  const isCardComplete = () => {
+    if (selectedPaymentMethod === 'cash') return true;
+    if (selectedSavedCardId) return true; // using an existing saved card
+
+    const cleanNumber = cardForm.cardNumber.replace(/\D/g, '');
+    const cleanExpiry = cardForm.expiry.replace(/\D/g, '');
+    const cleanCvv = cardForm.cvv.replace(/\D/g, '');
+
+    return (
+      cleanNumber.length === 16 &&
+      cleanExpiry.length === 4 &&
+      cleanCvv.length >= 3 &&
+      cardForm.cardholderName.trim().length > 0
+    );
+  };
+
+    // Save Card Handler
+  const handleSaveCard = async (e) => {
+    e.preventDefault();
+    const cleanNumber = cardForm.cardNumber.replace(/\D/g, '');
+    const cleanExpiry = cardForm.expiry.replace(/\D/g, '');
+    const cleanCvv = cardForm.cvv.replace(/\D/g, '');
+
+    const errors = {};
+    if (cleanNumber.length !== 16) errors.cardNumber = 'Card number must be 16 digits';
+    if (!cardForm.cardholderName.trim()) errors.cardholderName = 'Name is required';
+    if (cleanExpiry.length !== 4) errors.expiry = 'MM/YY required';
+    if (cleanCvv.length < 3) errors.cvv = '3-4 digits required';
+
+    if (Object.keys(errors).length > 0) {
+      setCardFormErrors(errors);
+      return;
+    }
+
+    const cardPayload = {
+      customer_id: customerId, // links card to current customer
+      nickname: cardForm.nickname.trim() || `Card ending in ${cleanNumber.slice(-4)}`,
+      brand: cleanNumber.startsWith('4') ? 'Visa' : cleanNumber.startsWith('5') ? 'Mastercard' : 'Card',
+      last_four: cleanNumber.slice(-4), // ONLY store the last 4 digits
+      cardholder_name: cardForm.cardholderName.trim(),
+      expiry: cardForm.expiry,
+    };
+
+    try {
+      // Write to Supabase if customerId exists
+      if (customerId) {
+        const { data, error } = await supabase
+          .from('customer_payment_methods')
+          .insert([cardPayload])
+          .select();
+
+        if (error) throw error;
+
+        if (data && data.length > 0) {
+          const inserted = data[0];
+          const newCard = {
+            id: inserted.id.toString(),
+            nickname: inserted.nickname,
+            brand: inserted.brand,
+            last4: inserted.last_four,
+            cardholderName: inserted.cardholder_name,
+            expiry: inserted.expiry,
+          };
+          setSavedCards((prev) => [...prev, newCard]);
+          setSelectedSavedCardId(newCard.id);
+        }
+      } else {
+        // Fallback for guest state
+        const localCard = {
+          id: Date.now().toString(),
+          ...cardPayload,
+          last4: cardPayload.last_four,
+          cardholderName: cardPayload.cardholder_name,
+        };
+        setSavedCards((prev) => [...prev, localCard]);
+        setSelectedSavedCardId(localCard.id);
+      }
+
+      setIsAddingNewCard(false);
+      setCardFormErrors({});
+      // Clear sensitive inputs from form state
+      setCardForm({
+        nickname: '',
+        cardNumber: '',
+        cardholderName: '',
+        expiry: '',
+        cvv: '',
+      });
+    } catch (err) {
+      console.error('Error saving payment card:', err.message || err);
+      alert('Could not save card to account.');
+    }
+  };
+    /*
+
+    const newCard = {
+      id: Date.now().toString(),
+      nickname: cardForm.nickname.trim() || `Card ending in ${cleanNumber.slice(-4)}`,
+      brand: cleanNumber.startsWith('4') ? 'Visa' : cleanNumber.startsWith('5') ? 'Mastercard' : 'Card',
+      last4: cleanNumber.slice(-4),
+      cardholderName: cardForm.cardholderName.trim(),
+      expiry: cardForm.expiry,
+    };
+
+    setSavedCards((prev) => [...prev, newCard]);
+    setSelectedSavedCardId(newCard.id);
+    setIsAddingNewCard(false);
+    setCardFormErrors({});
+    */
+  
+
   // Final Payment and Receipt Submission
   const handleFinalPaymentSubmit = async () => {
     if (cart.length === 0) return;
 
-    // Validate Signature
-    if (signatureMode === 'draw' && !hasDrawnSignature) {
-      alert('Please draw your signature before placing the order.');
-      return;
-    }
-    if (signatureMode === 'type' && (!typedSignature.trim() || !signatureAgreed)) {
-      alert('Please type your name and check the consent box to sign.');
+    // Validate card information completion for credit/debit payments
+    if ((selectedPaymentMethod === 'credit' || selectedPaymentMethod === 'debit') && !isCardComplete()) {
+      const cleanNumber = cardForm.cardNumber.replace(/\D/g, '');
+      const cleanExpiry = cardForm.expiry.replace(/\D/g, '');
+      const cleanCvv = cardForm.cvv.replace(/\D/g, '');
+
+      const errors = {};
+      if (cleanNumber.length !== 16) errors.cardNumber = 'Card number must be 16 digits.';
+      if (!cardForm.cardholderName.trim()) errors.cardholderName = 'Cardholder name is required.';
+      if (cleanExpiry.length !== 4) errors.expiry = 'MM/YY required.';
+      if (cleanCvv.length < 3) errors.cvv = '3-4 digits required.';
+      errors.general = 'Please complete all required card fields above before authorizing payment.';
+
+      setCardFormErrors(errors);
       return;
     }
 
+    // Validate Signature
+    if (signatureMode === 'draw' && !hasDrawnSignature) {
+      setSignatureError('Please draw your signature before placing the order.');
+      return;
+    }
+    if (signatureMode === 'type' && (!typedSignature.trim() || !signatureAgreed)) {
+      setSignatureError('Please type your name and check the consent box to sign.');
+      return;
+    }
+
+    setSignatureError('');
     setIsSubmittingOrder(true);
 
     try {
@@ -1268,6 +1450,229 @@ const handleReorderPizza = (item) => {
                 </div>
               </div>
 
+              {/* Card Details and Saved Payments (For Credit and Debit) */}
+              {(selectedPaymentMethod === 'credit' || selectedPaymentMethod === 'debit') && (
+  <div className="p-4 rounded-2xl bg-stone-950/80 border border-stone-800 space-y-4 my-3">
+    <div className="flex justify-between items-center">
+      <label className="text-[11px] font-bold uppercase tracking-wider text-amber-200/90">
+        💳 {selectedPaymentMethod.toUpperCase()} Card Details
+      </label>
+      {savedCards && savedCards.length > 0 && (
+        <button
+          type="button"
+          onClick={() => {
+            setIsAddingNewCard((prev) => !prev);
+            setSelectedSavedCardId(null);
+          }}
+          className="text-[10px] text-amber-200/80 hover:text-amber-100 underline cursor-pointer"
+        >
+          {isAddingNewCard ? 'Select Saved Card' : '+ Use New Card'}
+        </button>
+      )}
+    </div>
+
+    {/* Saved Cards Picker (if cards exist and not adding new) */}
+    {!isAddingNewCard && savedCards && savedCards.length > 0 ? (
+      <div className="space-y-2">
+        <span className="text-[10px] text-stone-400 uppercase tracking-wider font-semibold block">
+          Choose from Saved Cards
+        </span>
+        <div className="grid grid-cols-1 gap-2">
+          {savedCards.map((card) => (
+            <button
+              key={card.id}
+              type="button"
+              onClick={() => setSelectedSavedCardId(card.id)}
+              className={`p-3 rounded-xl border text-left flex justify-between items-center transition-all cursor-pointer ${
+                selectedSavedCardId === card.id
+                  ? 'bg-amber-200/10 border-amber-300 text-stone-100 ring-1 ring-amber-300/40'
+                  : 'bg-stone-900/60 border-stone-800 text-stone-400 hover:border-stone-700'
+              }`}
+            >
+              <div>
+                <span className="font-semibold text-xs text-stone-200 block">
+                  {card.nickname}
+                </span>
+                <span className="text-[11px] text-stone-400 font-mono">
+                  {card.brand} •••• {card.last4} (Exp: {card.expiry})
+                </span>
+              </div>
+              {selectedSavedCardId === card.id && (
+                <span className="text-amber-300 text-xs font-bold">✓ Selected</span>
+              )}
+            </button>
+          ))}
+        </div>
+      </div>
+    ) : (
+      /* Manual Card Input Fields */
+      <div className="space-y-3 pt-1">
+        {/* Card Incomplete Error Banner */}
+        {cardFormErrors.general && (
+          <div className="p-3 rounded-xl bg-rose-950/40 border border-rose-500/80 text-rose-300 text-xs flex items-center gap-2">
+             <span>⚠️</span>
+             <span>{cardFormErrors.general}</span>
+          </div>
+        )}
+
+        <div>
+          <label className="block text-[10px] uppercase tracking-wider text-stone-400 mb-1">
+            Card Nickname (e.g. Husband's Debit)
+          </label>
+          <input
+            type="text"
+            placeholder="e.g. Husband's Debit, Joint Checking"
+            value={cardForm.nickname}
+            onChange={(e) => setCardForm((prev) => ({ ...prev, nickname: e.target.value }))}
+            className="w-full bg-stone-900 border border-stone-800 rounded-xl px-3.5 py-2 text-xs text-stone-200 placeholder-stone-600 focus:outline-none focus:border-amber-200/60"
+          />
+        </div>
+
+        <div>
+          <label className="block text-[10px] uppercase tracking-wider text-stone-400 mb-1">
+            Card Number
+          </label>
+          <input
+            type="text"
+            inputMode="numeric"
+            placeholder="1234 5678 9012 3456"
+            maxLength={19}
+            value={cardForm.cardNumber}
+            onChange={(e) => {
+              const formatted = formatCardNumber(e.target.value);
+              setCardForm((prev) => ({ ...prev, cardNumber: formatted }));
+              if (cardFormErrors.cardNumber || cardFormErrors.general) {
+                setCardFormErrors((prev) => ({ ...prev, cardNumber: null }));
+              }
+            }}
+            style={
+              cardFormErrors.cardNumber
+                ? { boxShadow: '0 0 15px rgba(239, 68, 68, 0.35)' }
+                : undefined
+            }
+            className={`w-full bg-stone-900 rounded-xl px-3.5 py-2 text-xs text-stone-200 font-mono focus:outline-none ${
+              cardFormErrors.cardNumber ? 'border border-red-500' : 'border border-stone-800 focus:border-amber-200/60'
+            }`}
+          />
+          {cardFormErrors.cardNumber && (
+            <p className="text-[10px] text-red-400 mt-0.5">{cardFormErrors.cardNumber}</p>
+          )}
+        </div>
+
+        <div>
+          <label className="block text-[10px] uppercase tracking-wider text-stone-400 mb-1">
+            Name on Card
+          </label>
+          <input
+            type="text"
+            placeholder="Full Name as shown on card"
+            value={cardForm.cardholderName}
+            onChange={(e) => {
+              setCardForm((prev) => ({ ...prev, cardholderName: e.target.value }));
+              if (cardFormErrors.cardholderName || cardFormErrors.general) {
+                setCardFormErrors((prev) => ({ ...prev, cardholderName: null }));
+              }
+            }}
+            style={
+              cardFormErrors.cardholderName
+                ? { boxShadow: '0 0 15px rgba(239, 68, 68, 0.35)' }
+                : undefined
+            }
+            className={`w-full bg-stone-900 rounded-xl px-3.5 py-2 text-xs text-stone-200 focus:outline-none ${
+              cardFormErrors.cardholderName ? 'border border-red-500' : 'border border-stone-800 focus:border-amber-200/60'
+            }`}
+          />
+          {cardFormErrors.cardholderName && (
+            <p className="text-[10px] text-red-400 mt-0.5">{cardFormErrors.cardholderName}</p>
+          )}
+        </div>
+
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-[10px] uppercase tracking-wider text-stone-400 mb-1">
+              Expiration (MM/YY)
+            </label>
+            <input
+              type="text"
+              inputMode="numeric"
+              placeholder="12/28"
+              maxLength={5}
+              value={cardForm.expiry}
+              onChange={(e) => {
+                const formatted = formatExpiry(e.target.value);
+                setCardForm((prev) => ({ ...prev, expiry: formatted }));
+                if (cardFormErrors.expiry || cardFormErrors.general) {
+                  setCardFormErrors((prev) => ({ ...prev, expiry: null }));
+                }
+              }}
+              style={
+                cardFormErrors.expiry
+                  ? { boxShadow: '0 0 15px rgba(239, 68, 68, 0.35)' }
+                  : undefined
+              }
+              className={`w-full bg-stone-900 rounded-xl px-3.5 py-2 text-xs text-stone-200 font-mono focus:outline-none ${
+                cardFormErrors.expiry ? 'border border-red-500' : 'border border-stone-800 focus:border-amber-200/60'
+              }`}
+            />
+            {cardFormErrors.expiry && (
+              <p className="text-[10px] text-red-400 mt-0.5">{cardFormErrors.expiry}</p>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-[10px] uppercase tracking-wider text-stone-400 mb-1">
+              CVV / CVC
+            </label>
+            <input
+              type="password"
+              inputMode="numeric"
+              placeholder="123"
+              maxLength={4}
+              value={cardForm.cvv}
+              onChange={(e) => {
+                const clean = e.target.value.replace(/\D/g, '').slice(0, 4);
+                setCardForm((prev) => ({ ...prev, cvv: clean }));
+                if (cardFormErrors.cvv || cardFormErrors.general) {
+                  setCardFormErrors((prev) => ({ ...prev, cvv: null }));
+                }
+              }}
+              style={
+                cardFormErrors.cvv
+                  ? { boxShadow: '0 0 15px rgba(239, 68, 68, 0.35)' }
+                  : undefined
+              }
+              className={`w-full bg-stone-900 rounded-xl px-3.5 py-2 text-xs text-stone-200 font-mono focus:outline-none ${
+                cardFormErrors.cvv ? 'border border-red-500' : 'border border-stone-800 focus:border-amber-200/60'
+              }`}
+            />
+            {cardFormErrors.cvv && (
+              <p className="text-[10px] text-red-400 mt-0.5">{cardFormErrors.cvv}</p>
+            )}
+          </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={handleSaveCard}
+          className="w-full py-2.5 bg-stone-800 hover:bg-stone-700 text-amber-200 text-xs font-semibold rounded-xl border border-stone-700 hover:border-amber-200/40 transition-all cursor-pointer"
+        >
+          💾 Save Card Info
+        </button>
+      </div>
+    )}
+  </div>
+)}
+{/* ========================================================================= */}
+
+
+
+
+
+
+
+
+
+
               {/* Gratuity / Tip Selection */}
               <div className="space-y-2">
                 <label className="block text-[11px] font-bold uppercase tracking-wider text-amber-200/90">
@@ -1341,7 +1746,20 @@ const handleReorderPizza = (item) => {
               </div>
 
               {/* Digital Signature Pad */}
-              <div className="space-y-3 pt-2 border-t border-stone-800">
+              <div className="relative space-y-3 pt-2 border-t border-stone-800">
+                 
+                 {/* Disabled Overlay if card into is not completed */}
+                 {!isCardComplete() && (
+                   <div className="absolute inset-0 z-10 bg-stone-900/85 backdrop-blur-[2px] rounded-2xl flex flex-col items-center justify-center p-4 text-center border border-dashed border-stone-700">
+                     <span className="text-xl mb-1">🔒</span>
+                     <p className="text-xs font-semibold text-amber-200/90">Card Details Required</p>
+                     <p className="text-[10px] text-stone-400 mt-0.5">
+                       Please complete the card details or select a prior saved card above.
+                     </p>
+                   </div>
+                 )}
+
+
                 <div className="flex justify-between items-center">
                   <label className="block text-[11px] font-bold uppercase tracking-wider text-amber-200/90">
                     Customer Signature
@@ -1349,7 +1767,12 @@ const handleReorderPizza = (item) => {
                   <div className="flex gap-2 text-[10px]">
                     <button
                       type="button"
-                      onClick={() => setSignatureMode('draw')}
+                      disabled={!isCardComplete()}
+                      onClick={() => {
+                        setSignatureMode('draw');
+                        setSignatureError('');
+                               
+                      }}
                       className={`px-2 py-0.5 rounded cursor-pointer ${
                         signatureMode === 'draw' ? 'bg-amber-200/20 text-amber-200 font-bold' : 'text-stone-500'
                       }`}
@@ -1359,7 +1782,11 @@ const handleReorderPizza = (item) => {
                     <span>|</span>
                     <button
                       type="button"
-                      onClick={() => setSignatureMode('type')}
+                      disabled={!isCardComplete()}
+                      onClick={() => {
+                        setSignatureMode('type');
+                        setSignatureError('');
+                      }}
                       className={`px-2 py-0.5 rounded cursor-pointer ${
                         signatureMode === 'type' ? 'bg-amber-200/20 text-amber-200 font-bold' : 'text-stone-500'
                       }`}
@@ -1371,25 +1798,44 @@ const handleReorderPizza = (item) => {
 
                 {signatureMode === 'draw' ? (
                   <div className="space-y-1.5">
-                    <div className="relative border border-stone-700/80 rounded-2xl bg-stone-950 overflow-hidden touch-none">
+                    <div
+                      style={
+                        signatureError
+                          ? { boxShadow: '0 0 18px rgba(239, 68, 68, 0.45)' }
+                          : undefined
+                       }
+                      className={`relative rounded-2xl bg-stone-950 overflow-hidden touch-none transition-all duration-300 ${
+                        signatureError
+                          ? 'border-2 border-red-500 ring-2 ring-red-500/50 bg-red-950/20'
+                          : 'border border-stone-700/80'
+                       }`}
+                    >
                       <canvas
                         ref={canvasRef}
                         width={400}
                         height={120}
-                        onMouseDown={startDrawing}
-                        onMouseMove={draw}
-                        onMouseUp={stopDrawing}
-                        onMouseLeave={stopDrawing}
-                        onTouchStart={startDrawing}
-                        onTouchMove={draw}
-                        onTouchEnd={stopDrawing}
+                        onMouseDown={isCardComplete() ? startDrawing : undefined}
+                        onMouseMove={isCardComplete() ? draw : undefined}
+                        onMouseUp={isCardComplete() ? stopDrawing : undefined}
+                        onMouseLeave={isCardComplete() ? stopDrawing : undefined}
+                        onTouchStart={isCardComplete() ? startDrawing : undefined}
+                        onTouchMove={isCardComplete() ? draw : undefined}
+                        onTouchEnd={isCardComplete() ? stopDrawing : undefined}
                         className="w-full h-[120px] cursor-crosshair"
                       />
                       <div className="absolute bottom-2 left-4 text-[10px] text-stone-600 font-mono pointer-events-none select-none">
                         Sign along the line ✍️
                       </div>
                     </div>
-                    <div className="flex justify-end">
+
+                    <div className="flex justify-between items-center">
+                      {signatureError ? (
+                        <p className="text=[11px] text-rose-400 font-medium">
+                          {signatureError}
+                        </p>
+                      ) : (
+                        <span />
+                      )}
                       <button
                         type="button"
                         onClick={clearCanvasSignature}
@@ -1403,20 +1849,44 @@ const handleReorderPizza = (item) => {
                   <div className="space-y-2">
                     <input
                       type="text"
+                      disabled={!isCardComplete()}
                       placeholder="Type your full legal name"
                       value={typedSignature}
+                      onChange={(e) => {
+                        setTypedSignature(e.target.value);
+                        if (signatureError) setSignatureError('');
+                      }}
+                      style={
+                        signatureError
+                          ? { boxShadow: '0 0 18px rgba(239, 68, 68, 0.45)' }
+                          : undefined
+                      }
+                      className={`w-full rounded-xl px-4 py-2 text-xs font-serif italic text-base transition-all duration-300 outline-none ${
+                        signatureError
+                          ? 'border-2 border-red-500 ring-2 ring-red-500/50 bg-red-950/20 text-red-200'
+                          : 'bg-stone-950 border border-stone-800 text-stone-200 focus:border-amber-200/60'
+                      }`}
+                      /*
                       onChange={(e) => setTypedSignature(e.target.value)}
                       className="w-full bg-stone-950 border border-stone-800 rounded-xl px-4 py-2 text-xs text-stone-200 font-serif italic text-base focus:outline-none focus:border-amber-200/60"
+                      */
                     />
                     <label className="flex items-center gap-2 text-[11px] text-stone-400 cursor-pointer">
                       <input
                         type="checkbox"
+                        disabled={!isCardComplete()}
                         checked={signatureAgreed}
-                        onChange={(e) => setSignatureAgreed(e.target.checked)}
+                        onChange={(e) => {
+                          setSignatureAgreed(e.target.checked);
+                          if (signatureError) setSignatureError('');
+                        }}
                         className="rounded border-stone-700 accent-amber-200 cursor-pointer"
-                      />
+                        />
                       <span>I authorize this transaction and accept this as my signature</span>
                     </label>
+                    {signatureError && (
+                      <p className="text-[11px] text-rose-400 font-medium">{signatureError}</p>
+                    )}
                   </div>
                 )}
               </div>
@@ -1453,3 +1923,4 @@ const handleReorderPizza = (item) => {
     </div>
   );
 }
+
